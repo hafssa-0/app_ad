@@ -1,4 +1,4 @@
-"""Aide à la décision : méthodes MCDM (Streamlit)
+"""Aide à la décision : méthodes MCDM + Fuzzy TOPSIS (Streamlit)
 Lancer avec :  streamlit run app.py
 """
 import numpy as np
@@ -9,7 +9,7 @@ from scipy.optimize import linprog
 VIOLET = "#A855F7"
 
 # =====================================================================
-#  FONCTIONS DE CALCUL (indépendantes de l'interface)
+#  FONCTIONS DE CALCUL (Crisp & Fuzzy)
 # =====================================================================
 
 def classement(noms, scores, nom_col="Score", plus_grand_mieux=True):
@@ -19,14 +19,12 @@ def classement(noms, scores, nom_col="Score", plus_grand_mieux=True):
 
 
 def normaliser_ratio(X, cost):
-    """x/max (benefit) ou min/x (cost) -- méthodes WSM/WPM/WASPAS et entropie."""
     R = X / X.max(axis=0)
     R[:, cost] = X.min(axis=0)[cost] / X[:, cost]
     return R
 
 
 def normaliser_minmax(X, cost):
-    """Normalisation min-max utilisée par CRITIC."""
     mn, mx = X.min(axis=0), X.max(axis=0)
     den = np.where(mx - mn == 0, 1, mx - mn)
     R = (X - mn) / den
@@ -49,7 +47,6 @@ def ahp_poids(A):
 
 
 def bwm_poids(n, b, w_, BO, OW):
-    """Programme linéaire : min xi  avec  |wB - wj*aBj| <= xi  et  |wj - wW*ajW| <= xi."""
     rows = []
     for j in range(n):
         r = np.zeros(n + 1); r[b] += 1; r[j] -= BO[j]; r[n] = -1; rows.append(r)
@@ -124,12 +121,59 @@ def spearman(r1, r2):
     return 1 - 6 * (d ** 2).sum() / (n * (n ** 2 - 1))
 
 
+# --- Fuzzy TOPSIS Fonctions ---
+def distance_tfn(t1, t2):
+    return np.sqrt(1/3 * ((t1[0] - t2[0])**2 + (t1[1] - t2[1])**2 + (t1[2] - t2[2])**2))
+
+
+def fuzzy_topsis_calc(X_fuzzy, w_fuzzy, cost_mask):
+    """
+    X_fuzzy: ndarray de forme (m, n, 3)
+    w_fuzzy: ndarray de forme (n, 3)
+    cost_mask: array de booléens (True si coût)
+    """
+    m, n, _ = X_fuzzy.shape
+    R = np.zeros_like(X_fuzzy, dtype=float)
+
+    for j in range(n):
+        if cost_mask[j]:
+            a_min = X_fuzzy[:, j, 0].min()
+            for i in range(m):
+                a, b, c = X_fuzzy[i, j]
+                R[i, j] = (a_min / max(c, 1e-6), a_min / max(b, 1e-6), a_min / max(a, 1e-6))
+        else:
+            c_max = X_fuzzy[:, j, 2].max()
+            for i in range(m):
+                a, b, c = X_fuzzy[i, j]
+                R[i, j] = (a / max(c_max, 1e-6), b / max(c_max, 1e-6), c / max(c_max, 1e-6))
+
+    V = np.zeros_like(R)
+    for i in range(m):
+        for j in range(n):
+            wa, wb, wc = w_fuzzy[j]
+            ra, rb, rc = R[i, j]
+            V[i, j] = (ra * wa, rb * wb, rc * wc)
+
+    v_star = np.array([1.0, 1.0, 1.0])
+    v_minus = np.array([0.0, 0.0, 0.0])
+
+    D_star = np.zeros(m)
+    D_minus = np.zeros(m)
+    for i in range(m):
+        d_s = sum(distance_tfn(V[i, j], v_star) for j in range(n))
+        d_m = sum(distance_tfn(V[i, j], v_minus) for j in range(n))
+        D_star[i] = d_s
+        D_minus[i] = d_m
+
+    CC = D_minus / (D_minus + D_star + 1e-10)
+    return R, V, D_star, D_minus, CC
+
+
 # =====================================================================
 #  OUTILS D'INTERFACE
 # =====================================================================
 
 def donnees():
-    """Retourne la matrice enregistrée ou None (avec un message)."""
     d = st.session_state.get("data")
     if d is None:
         st.warning("Commence par enregistrer une matrice dans « Accueil / Matrice de décision ».")
@@ -150,7 +194,6 @@ def exiger_positif(X):
 
 
 def bloc_poids(crits, key):
-    """Choix des poids : égaux, manuels, ou issus d'une autre méthode déjà calculée."""
     n = len(crits)
     stock = st.session_state.setdefault("poids", {})
     choix = st.selectbox("Poids des critères", ["Poids égaux", "Saisie manuelle"] + list(stock), key=key + "_src")
@@ -192,7 +235,6 @@ def fmt(v):
 
 
 def comparaisons(noms, key, phrase):
-    """Matrice de comparaison par paires (échelle de Saaty)."""
     n = len(noms)
     A = np.ones((n, n))
     for i in range(n):
@@ -213,18 +255,8 @@ def page_accueil():
 
     with st.expander("Rappel : qu'est-ce que le MCDM ?"):
         st.markdown("""
-Un décideur doit choisir parmi plusieurs **alternatives** selon plusieurs **critères** souvent contradictoires
-(coût, qualité, risque…). Aucune alternative n'est la meilleure partout : il faut **pondérer** les critères et
-trouver un **compromis**. C'est le rôle des méthodes MCDM (Multi-Criteria Decision Making).
-
-La matrice de décision contient $x_{ij}$ = score de l'alternative $A_i$ pour le critère $C_j$.
-
-**Ordre d'utilisation :**
-1. **Pondérer** les critères : subjectif (AHP, BWM) ou objectif (Entropie, CRITIC).
-2. **Classer** les alternatives : WSM, WPM, WASPAS, TOPSIS, VIKOR.
-3. **Comparer** les classements (corrélation de Spearman) et faire une analyse de sensibilité.
-
-**Critères *benefit*** : plus c'est grand, mieux c'est. **Critères *cost*** : plus c'est petit, mieux c'est.
+Un décideur doit choisir parmi plusieurs **alternatives** selon plusieurs **critères** souvent contradictoires.
+Cette application intègre à la fois les méthodes classiques (**Crisp MCDM**) et les méthodes sous incertitude (**Fuzzy TOPSIS**).
 """)
 
     st.header("Matrice de décision")
@@ -245,7 +277,7 @@ La matrice de décision contient $x_{ij}$ = score de l'alternative $A_i$ pour le
     else:
         base = pd.DataFrame(1.0, index=alts, columns=crits)
 
-    st.write("**Valeurs de la matrice :**")
+    st.write("**Valeurs de la matrice (Crisp) :**")
     df = st.data_editor(base, key="ed_" + "|".join(alts) + "#" + "|".join(crits))
     couts = st.multiselect("Critères à minimiser (coût)", crits,
                            default=[c for c in (saved["couts"] if saved else []) if c in crits])
@@ -264,27 +296,9 @@ def page_ahp():
     st.title("AHP : Analytic Hierarchy Process")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
         st.markdown("""
-**Principe.** Méthode **subjective** : l'expert compare les critères **deux à deux** avec l'échelle de Saaty
-(1 = égale importance, 9 = extrêmement plus important). On obtient une matrice $A$ avec $a_{ji} = 1/a_{ij}$.
-
-**Poids (méthode approximative).**
-1. Somme de chaque colonne : $s_j = \\sum_i a_{ij}$
-2. Diviser chaque élément par la somme de sa colonne
-3. Le poids $w_i$ est la **moyenne de chaque ligne**
+**Principe.** Méthode **subjective** : l'expert compare les critères **deux à deux** avec l'échelle de Saaty.
 """)
         st.latex(r"\lambda_{max}=\sum_i s_i\,w_i \qquad CI=\frac{\lambda_{max}-n}{n-1} \qquad CR=\frac{CI}{RI}")
-        st.markdown("""
-**Test de consistance.** Si $CR < 0{,}1$ les jugements sont cohérents et les poids sont conservés.
-($RI$ : 0,58 pour n=3 ; 0,90 pour n=4 ; 1,12 pour n=5 ; …)
-
-**Classement des alternatives.** On compare les alternatives deux à deux **pour chaque critère** (priorités locales),
-puis on combine avec les poids :
-""")
-        st.latex(r"P_i=\sum_j w_j\,w_{ij}")
-        st.markdown("""
-**Pourquoi l'utiliser ?** Quand les poids viennent du **jugement d'un expert** et qu'on veut **vérifier sa cohérence**.
-*Limite* : beaucoup de comparaisons, de l'ordre de $n(n-1)/2$.
-""")
     d = donnees()
     if d is None:
         return
@@ -301,24 +315,8 @@ puis on combine avec les poids :
     if CR < 0.1:
         st.success("CR < 0,1 : les jugements sont cohérents.")
     else:
-        st.error("CR ≥ 0,1 : jugements incohérents, révise tes comparaisons.")
+        st.error("CR ≥ 0,1 : jugements incohérents.")
     sauver_poids("AHP", crits, w)
-
-    st.subheader("2) Classement des alternatives (optionnel)")
-    if st.checkbox("Comparer aussi les alternatives critère par critère"):
-        local = np.zeros((len(alts), len(crits)))
-        for k, c in enumerate(crits):
-            with st.expander(f"Alternatives selon le critère {c}"):
-                Ak = comparaisons(alts, f"ahp_a{k}", "Selon **" + c + "** : **{a}** est ... fois meilleure que **{b}**")
-                wk, _, _, crk = ahp_poids(Ak)
-                local[:, k] = wk
-                st.write(f"CR = {crk:.4f} " + ("(cohérent)" if crk < 0.1 else "(incohérent)"))
-        final = local @ w
-        out = pd.DataFrame(local, index=alts, columns=crits)
-        out["Priorité finale"] = final
-        out["Rang"] = out["Priorité finale"].rank(ascending=False, method="min").astype(int)
-        aff(out)
-        meilleure(out, "Priorité finale")
 
 
 # ---------------------------------------------------------------- BWM
@@ -326,21 +324,9 @@ def page_bwm():
     st.title("BWM : Best-Worst Method")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
         st.markdown("""
-**Principe.** Méthode **subjective** (Rezaei, 2015). L'expert choisit le critère **le meilleur (Best)** et le
-**pire (Worst)**, puis ne compare chaque critère qu'à ces deux repères (échelle 1 à 9) :
-- vecteur **Best-to-Others** : $a_{Bj}$
-- vecteur **Others-to-Worst** : $a_{jW}$
-
-Idéalement $w_B/w_j = a_{Bj}$ et $w_j/w_W = a_{jW}$. En pratique on cherche les poids qui minimisent
-l'écart maximal $\\xi$ : c'est un **programme linéaire**.
+**Principe.** Méthode **subjective** (Rezaei, 2015). Moins de comparaisons requises ($2n-3$).
 """)
-        st.latex(r"\min \xi \quad \text{s.c.}\quad |w_B - a_{Bj}\,w_j|\le\xi,\quad |w_j - a_{jW}\,w_W|\le\xi,\quad \sum_j w_j=1,\ w_j\ge 0")
-        st.markdown("""
-$\\xi^*$ proche de 0 = jugements cohérents.
-
-**Pourquoi l'utiliser ?** Il demande **moins de comparaisons** que l'AHP : $2n-3$ contre $n(n-1)/2$,
-et donne des jugements plus cohérents.
-""")
+        st.latex(r"\min \xi \quad \text{s.c.}\quad |w_B - a_{Bj}\,w_j|\le\xi,\quad |w_j - a_{jW}\,w_W|\le\xi,\quad \sum_j w_j=1")
     d = donnees()
     if d is None:
         return
@@ -354,25 +340,21 @@ et donne des jugements plus cohérents.
         return
     b, wi = crits.index(best), crits.index(worst)
 
-    st.write("**Best-to-Others** : combien de fois le Best est plus important que chaque critère (1 à 9)")
     BO = np.ones(n)
     cols = st.columns(n)
     for j in range(n):
         if j != b:
             BO[j] = cols[j].number_input(f"{best} / {crits[j]}", 1, 9, 2, key=f"bo{j}")
-    st.write("**Others-to-Worst** : combien de fois chaque critère est plus important que le Worst (1 à 9)")
     OW = np.ones(n)
     cols = st.columns(n)
     for j in range(n):
         if j != wi:
             OW[j] = cols[j].number_input(f"{crits[j]} / {worst}", 1, 9, 2, key=f"ow{j}")
 
-    if BO[wi] < BO.max():
-        st.warning("Contrôle : la note la plus élevée du vecteur BO devrait porter sur le critère Worst.")
     w, xi = bwm_poids(n, b, wi, BO, OW)
     aff(pd.DataFrame({"Poids": w}, index=crits))
     graphique_poids(crits, w)
-    st.write(f"ξ* = **{xi:.4f}** " + ("(proche de 0 : jugements cohérents)" if xi < 0.1 else "(assez élevé : jugements peu cohérents)"))
+    st.write(f"ξ* = **{xi:.4f}**")
     sauver_poids("BWM", crits, w)
 
 
@@ -380,19 +362,8 @@ et donne des jugements plus cohérents.
 def page_entropie():
     st.title("Entropie")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** Méthode **objective** : les poids sont calculés **à partir des données**. L'entropie mesure le
-désordre d'une colonne :
-- entropie élevée (proche de 1) : valeurs presque égales, le critère distingue mal les alternatives, **poids faible** ;
-- entropie faible : valeurs dispersées, le critère discrimine bien, **poids élevé**.
-""")
-        st.latex(r"p_{ij}=\frac{d_{ij}}{\sum_i d_{ij}} \qquad E_j=-\frac{1}{\ln m}\sum_i p_{ij}\ln p_{ij} \qquad w_j=\frac{1-E_j}{n-\sum_k E_k}")
-        st.markdown("""
-($d_{ij}$ : matrice normalisée par $x/\\max$ pour un critère benefit, $\\min/x$ pour un coût ; $m$ : nombre d'alternatives.)
-
-**Pourquoi l'utiliser ?** Aucun avis d'expert nécessaire, résultat **reproductible**.
-*Limite* : ignore l'importance réelle des critères.
-""")
+        st.markdown("Mesure du désordre et de la dispersion objective des données.")
+        st.latex(r"E_j=-\frac{1}{\ln m}\sum_i p_{ij}\ln p_{ij} \qquad w_j=\frac{1-E_j}{n-\sum_k E_k}")
     d = donnees()
     if d is None:
         return
@@ -400,10 +371,7 @@ désordre d'une colonne :
     if not exiger_positif(X):
         return
     P, E, div, w = entropie_poids(X, cost)
-    st.write("**Proportions $p_{ij}$**")
-    aff(pd.DataFrame(P, index=alts, columns=crits))
-    res = pd.DataFrame({"Entropie Ej": E, "1 - Ej": div, "Poids wj": w}, index=crits)
-    aff(res)
+    aff(pd.DataFrame({"Entropie Ej": E, "1 - Ej": div, "Poids wj": w}, index=crits))
     graphique_poids(crits, w)
     sauver_poids("Entropie", crits, w)
 
@@ -412,28 +380,13 @@ désordre d'une colonne :
 def page_critic():
     st.title("CRITIC")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** Méthode **objective**. Un critère est important s'il est **très dispersé** (écart-type élevé)
-et **peu corrélé** avec les autres (il apporte une information nouvelle).
-
-1. Normalisation min-max : benefit $r_{ij}=\\dfrac{x_{ij}-\\min x_j}{\\max x_j-\\min x_j}$ ; cost $r_{ij}=\\dfrac{\\max x_j-x_{ij}}{\\max x_j-\\min x_j}$
-2. Coefficients de corrélation $\\rho_{jk}$ entre les colonnes
-3. Indice d'information puis poids :
-""")
+        st.markdown("Prend en compte l'écart-type (dispersion) et l'indépendance (corrélations).")
         st.latex(r"C_j=\sigma_j\sum_{k=1}^{n}\left(1-|\rho_{jk}|\right) \qquad w_j=\frac{C_j}{\sum_j C_j}")
-        st.markdown("""
-**Pourquoi l'utiliser ?** Comme l'entropie, il n'exige aucun avis d'expert, mais il tient compte en plus
-des **corrélations entre critères**.
-""")
     d = donnees()
     if d is None:
         return
     alts, crits, X, cost = d
     R, rho, sigma, C, w = critic_poids(X, cost)
-    st.write("**Matrice normalisée**")
-    aff(pd.DataFrame(R, index=alts, columns=crits))
-    st.write("**Corrélations $\\rho_{jk}$**")
-    aff(pd.DataFrame(rho, index=crits, columns=crits))
     aff(pd.DataFrame({"Écart-type σj": sigma, "Indice Cj": C, "Poids wj": w}, index=crits))
     graphique_poids(crits, w)
     sauver_poids("CRITIC", crits, w)
@@ -443,18 +396,8 @@ des **corrélations entre critères**.
 def page_waspas():
     st.title("WSM - WPM - WASPAS")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** Méthodes **additives / compensatoires** : un bon score sur un critère peut compenser un mauvais score
-sur un autre. On normalise d'abord la matrice : benefit $r_{ij}=x_{ij}/\\max_i x_{ij}$ ; cost $r_{ij}=\\min_i x_{ij}/x_{ij}$.
-""")
-        st.latex(r"\textbf{WSM : } Q_i^{(1)}=\sum_{j}w_j\,r_{ij} \qquad \textbf{WPM : } Q_i^{(2)}=\prod_{j}(r_{ij})^{w_j}")
-        st.latex(r"\textbf{WASPAS : } Q_i=\lambda\,Q_i^{(1)}+(1-\lambda)\,Q_i^{(2)},\quad \lambda\in[0,1]\ (\lambda=0{,}5 \Rightarrow Q_i=\tfrac12(Q^{(1)}_i+Q^{(2)}_i))")
-        st.markdown("""
-La meilleure alternative est celle qui a le **Q le plus élevé**.
-
-**Pourquoi l'utiliser ?** Ce sont les méthodes les **plus simples** et faciles à expliquer.
-WASPAS combine WSM et WPM pour une **meilleure précision**.
-""")
+        st.markdown("Méthodes additives et multiplicatives combinées.")
+        st.latex(r"Q_i=\lambda\,\sum w_j r_{ij} + (1-\lambda)\,\prod (r_{ij})^{w_j}")
     d = donnees()
     if d is None:
         return
@@ -464,44 +407,24 @@ WASPAS combine WSM et WPM pour une **meilleure précision**.
     w = bloc_poids(crits, "wsm")
     lam = st.slider("λ (WASPAS)", 0.0, 1.0, 0.5, 0.05)
     R, q1, q2, q = wsm_wpm_waspas(X, cost, w, lam)
-    st.write("**Matrice normalisée**")
-    aff(pd.DataFrame(R, index=alts, columns=crits))
     out = pd.DataFrame({"WSM": q1, "WPM": q2, "WASPAS": q}, index=alts)
     for m in ["WSM", "WPM", "WASPAS"]:
         out["Rang " + m] = out[m].rank(ascending=False, method="min").astype(int)
     aff(out)
-    st.success(f"Meilleure alternative (WASPAS) : **{out['WASPAS'].idxmax()}**")
 
 
 # ---------------------------------------------------------------- TOPSIS
 def page_topsis():
     st.title("TOPSIS")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** On construit une solution **idéale positive** $I^+$ (meilleur score de chaque critère) et une
-solution **idéale négative** $I^-$ (pire score). On retient l'alternative **la plus proche de $I^+$** et
-**la plus éloignée de $I^-$**.
-
-1. Normalisation vectorielle : $r_{ij}=\\dfrac{x_{ij}}{\\sqrt{\\sum_i x_{ij}^2}}$
-2. Matrice pondérée : $v_{ij}=w_j\\,r_{ij}$
-3. Solutions idéales : $v_j^*=\\max_i v_{ij}$ (benefit) ou $\\min_i v_{ij}$ (cost) ; $v_j'$ l'inverse
-4. Distances :
-""")
-        st.latex(r"S_i^+=\sqrt{\sum_j (v_j^*-v_{ij})^2} \qquad S_i^-=\sqrt{\sum_j (v_j'-v_{ij})^2}")
-        st.markdown("5. Coefficient de proximité (le plus élevé = le meilleur) :")
+        st.markdown("Distance à la solution idéale positive et négative.")
         st.latex(r"RC_i^*=\frac{S_i^-}{S_i^+ + S_i^-}\in[0,1]")
-        st.markdown("""
-**Pourquoi l'utiliser ?** Très populaire : la logique de **distance à l'idéal** est intuitive et le calcul reste simple.
-""")
     d = donnees()
     if d is None:
         return
     alts, crits, X, cost = d
     w = bloc_poids(crits, "top")
     R, V, ideal, anti, sp, sm, rc = topsis(X, cost, w)
-    st.write("**Matrice normalisée pondérée $v_{ij}$**")
-    aff(pd.DataFrame(V, index=alts, columns=crits))
-    aff(pd.DataFrame({"Idéal positif I+": ideal, "Idéal négatif I-": anti}, index=crits))
     out = pd.DataFrame({"S+": sp, "S-": sm, "RC*": rc}, index=alts)
     out["Rang"] = out["RC*"].rank(ascending=False, method="min").astype(int)
     aff(out)
@@ -512,26 +435,8 @@ solution **idéale négative** $I^-$ (pire score). On retient l'alternative **la
 def page_vikor():
     st.title("VIKOR")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** Méthode de **classement par compromis**. Pour chaque critère : $x_j^*$ = meilleure valeur et
-$x_j^-$ = pire valeur.
-""")
-        st.latex(r"S_i=\sum_j w_j\frac{x_j^*-x_{ij}}{x_j^*-x_j^-} \qquad R_i=\max_j\left[w_j\frac{x_j^*-x_{ij}}{x_j^*-x_j^-}\right]")
-        st.latex(r"Q_i=v\,\frac{S_i-S^*}{S^--S^*}+(1-v)\,\frac{R_i-R^*}{R^--R^*}")
-        st.markdown("""
-$S_i$ = utilité de **groupe**, $R_i$ = **regret individuel**, $v$ = poids de la stratégie de groupe (souvent 0,5).
-$S^*=\\min S_i$, $S^-=\\max S_i$ (idem pour $R$). **Plus $Q$, $S$, $R$ sont petits, meilleure est l'alternative.**
-
-**Solution de compromis** : l'alternative $A'$ (plus petit $Q$) est retenue si :
-- **Avantage acceptable** : $Q(A'')-Q(A')\\ge \\dfrac{1}{m-1}$ ($A''$ = deuxième du classement Q)
-- **Stabilité acceptable** : $A'$ est aussi la meilleure selon $S$ et $R$
-
-Sinon : si seule la stabilité échoue, on propose $A'$ et $A''$ ; si l'avantage échoue, on propose $A', A'', ..., A_k$
-avec $Q(A_k)-Q(A')<\\dfrac{1}{m-1}$.
-
-**Pourquoi l'utiliser ?** Il maximise la **satisfaction du groupe** et minimise le **regret individuel** : utile
-pour la **négociation** entre décideurs.
-""")
+        st.markdown("Classement de compromis basé sur l'utilité de groupe (S) et le regret individuel (R).")
+        st.latex(r"Q_i=v\,\frac{S_i-S^*}{S^--S^*}+(1-v)\,\frac{R_i-R^*}{R^--R^R}")
     d = donnees()
     if d is None:
         return
@@ -544,38 +449,87 @@ pour la **négociation** entre décideurs.
         out["Rang " + c] = out[c].rank(method="min").astype(int)
     aff(out)
 
-    m = len(alts)
-    ordre = out["Q"].sort_values().index.tolist()
-    a1, a2 = ordre[0], ordre[1]
-    c1 = out.loc[a2, "Q"] - out.loc[a1, "Q"] >= 1 / (m - 1)
-    c2 = out.loc[a1, "Rang S"] == 1 and out.loc[a1, "Rang R"] == 1
-    st.write(f"Condition 1 (avantage acceptable) : **{'vérifiée' if c1 else 'non vérifiée'}**")
-    st.write(f"Condition 2 (stabilité acceptable) : **{'vérifiée' if c2 else 'non vérifiée'}**")
-    if c1 and c2:
-        st.success(f"Solution de compromis : **{a1}**")
-    elif c1:
-        st.info(f"Solutions de compromis : **{a1}** et **{a2}**")
-    else:
-        k = [a for a in ordre if out.loc[a, "Q"] - out.loc[a1, "Q"] < 1 / (m - 1)]
-        st.info("Solutions de compromis : **" + "**, **".join(k) + "**")
+
+# ---------------------------------------------------------------- FUZZY TOPSIS
+def page_fuzzy_topsis():
+    st.title("Fuzzy TOPSIS (Nombres Flous Triangulaires)")
+    with st.expander("Principe et cours (Chen, 2000)", expanded=True):
+        st.markdown("""
+**Principe.** Quand l'information est imprécise ou subjective, on utilise des **nombres flous triangulaires (TFN)** notés $\\tilde{x} = (a, b, c)$[cite: 136, 137] :
+- $a$ : valeur pessimiste
+- $b$ : valeur la plus probable
+- $c$ : valeur optimiste
+
+Les étapes reproduisent le TOPSIS classique avec l'arithmétique floue (normalisation, pondération par des poids flous, distances euclidiennes floues et coefficient de proximité $CC_i$).
+""")
+
+    st.subheader("Configuration des données floues")
+    alts_input = st.text_area("Alternatives (une par ligne)", "Alternatif_1\nAlternatif_2\nAlternatif_3", height=70)
+    crits_input = st.text_area("Critères (un par ligne)", "C1\nC2\nC3", height=70)
+
+    alts = [a.strip() for a in alts_input.splitlines() if a.strip()]
+    crits = [c.strip() for c in crits_input.splitlines() if c.strip()]
+
+    if len(alts) < 2 or len(crits) < 2:
+        st.warning("Veuillez saisir au moins 2 alternatives et 2 critères.")
+        return
+
+    couts_fuzzy = st.multiselect("Critères de type Coût (à minimiser)", crits, key="ft_costs")
+
+    st.markdown("### Saisie de la matrice de décision floue (Format: `a, b, c`)")
+    st.caption("Exemple : `1, 3, 5` pour un nombre flou triangulaire.")
+
+    fuzzy_matrix = np.zeros((len(alts), len(crits), 3))
+    cols = st.columns(len(crits))
+
+    # Tableau de saisie simplifié via texte ou valeurs par défaut
+    for j, c in enumerate(crits):
+        cols[j].markdown(f"**{c}**")
+        for i, a in enumerate(alts):
+            default_val = f"{i+1+j}, {i+2+j}, {i+3+j}"
+            val_str = cols[j].text_input(f"{a} ({c})", value=default_val, key=f"ft_{i}_{j}")
+            try:
+                parts = [float(p.strip()) for p in val_str.split(",")]
+                if len(parts) == 3:
+                    fuzzy_matrix[i, j] = parts
+                else:
+                    fuzzy_matrix[i, j] = [1, 2, 3]
+            except:
+                fuzzy_matrix[i, j] = [1, 2, 3]
+
+    st.markdown("### Poids des critères (Nombres flous triangulaires)")
+    weight_matrix = np.zeros((len(crits), 3))
+    w_cols = st.columns(len(crits))
+    for j, c in enumerate(crits):
+        w_str = w_cols[j].text_input(f"Poids {c}", value="0.2, 0.3, 0.5", key=f"ft_w_{j}")
+        try:
+            parts = [float(p.strip()) for p in w_str.split(",")]
+            weight_matrix[j] = parts if len(parts) == 3 else [0.3, 0.3, 0.4]
+        except:
+            weight_matrix[j] = [0.3, 0.3, 0.4]
+
+    if st.button("Lancer le calcul Fuzzy TOPSIS"):
+        cost_mask = np.array([c in couts_fuzzy for c in crits])
+        R, V, D_star, D_minus, CC = fuzzy_topsis_calc(fuzzy_matrix, weight_matrix, cost_mask)
+
+        res_df = pd.DataFrame({
+            "D* (Distance Idéal Positif)": D_star,
+            "D- (Distance Idéal Négatif)": D_minus,
+            "Coefficient CCi": CC
+        }, index=alts)
+        res_df["Rang"] = res_df["Coefficient CCi"].rank(ascending=False, method="min").astype(int)
+
+        st.success("Calculs terminés avec succès !")
+        aff(res_df.sort_values("Rang"))
+        meilleure(res_df, "Coefficient CCi")
 
 
 # ---------------------------------------------------------------- Comparaison
 def page_comparaison():
     st.title("Comparaison des classements (Spearman)")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** Aucune méthode n'est la meilleure dans l'absolu. On applique plusieurs méthodes avec les **mêmes poids**
-et on mesure l'accord entre leurs classements avec la **corrélation de Spearman** :
-""")
+        st.markdown("Mesure l'accord entre les différents classements obtenus par les méthodes classiques.")
         st.latex(r"\rho=1-\frac{6\sum d_i^2}{n(n^2-1)}")
-        st.markdown("""
-$d_i$ = différence entre les deux rangs de l'alternative $i$.
-$\\rho=+1$ : classements identiques ; $\\rho=0$ : aucun lien ; $\\rho=-1$ : classements inversés.
-
-**Pourquoi l'utiliser ?** Pour vérifier la **robustesse** du choix : si les méthodes s'accordent sur les meilleures
-alternatives, la décision est solide. Sinon, faire une analyse de sensibilité (poids, normalisation).
-""")
     d = donnees()
     if d is None:
         return
@@ -588,37 +542,20 @@ alternatives, la décision est solide. Sinon, faire une analyse de sensibilité 
     Q = vikor(X, cost, w, 0.5)[2]
     scores = {"WSM": q1, "WPM": q2, "WASPAS": q, "TOPSIS": rc, "VIKOR": -Q}
     rangs = pd.DataFrame({k: pd.Series(s, index=alts).rank(ascending=False, method="min") for k, s in scores.items()}).astype(int)
-    st.write("**Rang de chaque alternative (1 = la meilleure)**")
     st.dataframe(rangs)
-    noms = list(rangs.columns)
-    M = pd.DataFrame([[spearman(rangs[a], rangs[b]) for b in noms] for a in noms], index=noms, columns=noms)
-    st.write("**Matrice de corrélation de Spearman**")
-    aff(M, 2)
 
 
 # ---------------------------------------------------------------- MAUT
 def page_maut():
     st.title("Alternative unique (MAUT)")
     with st.expander("Principe, formules et pourquoi l'utiliser", expanded=True):
-        st.markdown("""
-**Principe.** On évalue **une seule alternative** de façon absolue (sans la comparer à d'autres). Chaque critère
-est converti en **utilité** $u_j\\in[0,1]$, puis on agrège :
-""")
+        st.markdown("Évaluation absolue d'une seule alternative par rapport à des seuils d'utilité.")
         st.latex(r"S(A)=\sum_j w_j\,u_j(x_j)")
-        st.latex(r"u_j=\frac{x-x_j^{min}}{x_j^{max}-x_j^{min}}\ (\text{benefit}) \qquad u_j=\frac{x_j^{max}-x}{x_j^{max}-x_j^{min}}\ (\text{cost})")
-        st.markdown("""
-**Décision** avec un seuil $\\tau\\in[0,1]$ : **accepter si $S(A)\\ge\\tau$**, sinon rejeter.
-Le seuil est fixé par des experts, la réglementation, ou estimé à partir de décisions passées (courbe ROC, indice de Youden).
-
-**Pourquoi l'utiliser ?** Scoring de crédit, évaluation de performance, agrégation d'indicateurs (KPI) :
-quand il n'y a **pas d'autres alternatives** à comparer.
-""")
     d = donnees()
     if d is None:
         return
     alts, crits, X, cost = d
     w = bloc_poids(crits, "maut")
-    st.write("**Valeurs de l'alternative à évaluer** (min et max : bornes du critère, par défaut tirées de la matrice)")
     u = np.zeros(len(crits))
     for j, c in enumerate(crits):
         a, b_, e = st.columns(3)
@@ -639,7 +576,7 @@ quand il n'y a **pas d'autres alternatives** à comparer.
 
 
 # =====================================================================
-#  APPLICATION
+#  APPLICATION NAVIGATION
 # =====================================================================
 
 PAGES = {
@@ -651,6 +588,7 @@ PAGES = {
     "WSM - WPM - WASPAS": page_waspas,
     "TOPSIS": page_topsis,
     "VIKOR": page_vikor,
+    "Fuzzy TOPSIS": page_fuzzy_topsis,
     "Comparaison (Spearman)": page_comparaison,
     "Alternative unique (MAUT)": page_maut,
 }
